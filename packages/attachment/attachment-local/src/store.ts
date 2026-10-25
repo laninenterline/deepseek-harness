@@ -2,7 +2,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, createReadStream } from 'node:fs'
-import { chmod, link, mkdir, open, readFile, unlink } from 'node:fs/promises'
+import { chmod, copyFile, link, mkdir, open, readFile, unlink } from 'node:fs/promises'
 import { dirname, join, parse, resolve } from 'node:path'
 import {
   AttachmentError,
@@ -40,6 +40,30 @@ function ensureReference(ref: ImageAttachmentRef): string {
   const match = ID_PATTERN.exec(String(ref.attachmentId))
   if (match?.[1] === undefined) throw new AttachmentError('Attachment reference is invalid.', 'INVALID_ATTACHMENT_REF')
   return match[1]
+}
+
+/**
+ * Codes a filesystem returns when it cannot create a second name for a file:
+ * sandbox refusals, cross-device links, link-unsupported filesystems, and an
+ * exhausted link count.
+ */
+const LINK_UNAVAILABLE_CODES = new Set(['EACCES', 'EMLINK', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EXDEV'])
+
+/**
+ * Create `target` as a second durable name for `source`. Content addressing
+ * only requires both names to expose identical bytes, so a filesystem that
+ * refuses hard links receives an exclusive copy instead; `EEXIST` remains the
+ * caller's deduplication signal on both paths.
+ * @param source - existing file to name again.
+ * @param target - absolute name to create.
+ */
+async function linkOrCopy(source: string, target: string): Promise<void> {
+  try {
+    await link(source, target)
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && typeof error.code === 'string' && LINK_UNAVAILABLE_CODES.has(error.code))) throw error
+    await copyFile(source, target, constants.COPYFILE_EXCL)
+  }
 }
 
 /**
@@ -203,7 +227,8 @@ export async function commitPreparedImageFile(
 
 /**
  * Publish one immutable content-addressed object below a versioned attachment
- * root: staged write, fsync, hard-link into place, digest-verified EEXIST
+ * root: staged write, fsync, exclusive hard link (or an exclusive copy where
+ * the filesystem refuses links) into place, digest-verified EEXIST
  * deduplication, read-only mode, and durable directory entries from the
  * target's parent up to (excluding) `root`.
  * @param root - absolute `DSH_HOME/attachments/v1` root.
@@ -263,7 +288,7 @@ export async function publishImmutableObjectStream(
 }
 
 /**
- * Publish another durable hard-link name for an existing immutable object.
+ * Publish another durable name for an existing immutable object.
  * @param root - absolute versioned attachment root.
  * @param source - existing content-addressed object below `root`.
  * @param target - new alias below `root`.
@@ -280,7 +305,7 @@ export async function publishImmutableAlias(
     const boundary = await ensureDurableHome(dirname(dirname(resolve(root))))
     await ensureDurableDirectory(parent, boundary)
     try {
-      await link(source, target)
+      await linkOrCopy(source, target)
     } catch (error) {
       /* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
       if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
@@ -356,7 +381,7 @@ async function publishStagedObject(
   try {
     await ensureDurableDirectory(parent, staged.boundary)
     try {
-      await link(staged.path, target)
+      await linkOrCopy(staged.path, target)
     } catch (error) {
       /* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
       if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
